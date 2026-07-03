@@ -1,0 +1,1083 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+import textwrap
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+import pandas as pd
+import numpy as np
+
+import matplotlib
+matplotlib.use("TkAgg")
+
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_pdf import PdfPages
+
+from linearmodels.system import SUR
+import statsmodels.api as sm
+from statsmodels.stats.stattools import jarque_bera
+from scipy.stats import chi2
+
+
+# ============================================================
+# IMPORT WINDOW
+# ============================================================
+
+class ImportWindow:
+    """
+    This window is responsible for importing the dataset.
+
+    The user must provide an Excel or CSV file. The software assumes that:
+    - The first column is the dependent variable of equation 1.
+    - The second column is the dependent variable of equation 2.
+    - All remaining columns are explanatory variables.
+
+    Example structure:
+        Y1 | Y2 | X1 | X2 | X3 | ...
+    """
+
+    def __init__(self, root):
+
+        self.root = root
+        self.root.title("SURE Model Import")
+        self.root.geometry("520x240")
+
+        self.file_path = None
+        self.data = None
+
+        self.build_ui()
+
+    def build_ui(self):
+
+        title = tk.Label(
+            self.root,
+            text="SURE Econometric Analyzer",
+            font=("Arial", 16, "bold")
+        )
+        title.pack(pady=20)
+
+        subtitle = tk.Label(
+            self.root,
+            text="Import Excel or CSV file containing regression variables",
+            font=("Arial", 10)
+        )
+        subtitle.pack(pady=5)
+
+        import_btn = tk.Button(
+            self.root,
+            text="Import Data File",
+            width=22,
+            height=2,
+            command=self.import_file
+        )
+        import_btn.pack(pady=20)
+
+    def import_file(self):
+
+        file_path = filedialog.askopenfilename(
+            title="Select Data File",
+            filetypes=[
+                ("Excel and CSV files", "*.xlsx *.xls *.csv")
+            ]
+        )
+
+        if not file_path:
+            return
+
+        try:
+
+            if file_path.endswith(".csv"):
+                df = pd.read_csv(file_path)
+            else:
+                df = pd.read_excel(file_path)
+
+            # Basic cleaning: remove missing observations.
+            df = df.dropna()
+
+            if df.shape[1] < 4:
+                raise ValueError(
+                    "File must contain at least 4 columns:\n"
+                    "Example: Y1 Y2 X1 X2"
+                )
+
+            self.file_path = file_path
+            self.data = df
+
+            self.root.destroy()
+
+            main_root = tk.Tk()
+            app = AnalysisWindow(main_root, self.data, self.file_path)
+            main_root.mainloop()
+
+        except Exception as e:
+
+            messagebox.showerror("Import Error", str(e))
+
+
+# ============================================================
+# ANALYSIS WINDOW
+# ============================================================
+
+class AnalysisWindow:
+    """
+    Main analysis window.
+
+    This class performs:
+    1. Data summary
+    2. Separate OLS estimation for each equation
+    3. SURE estimation
+    4. Residual correlation analysis
+    5. Breusch-Pagan LM test for residual independence
+    6. Jarque-Bera normality diagnostics
+    7. Graphical residual analysis
+    8. PDF report export
+    """
+
+    def __init__(self, root, data, file_path):
+
+        self.root = root
+        self.data = data.copy()
+        self.file_path = file_path
+
+        self.pages = []
+        self.page_titles = []
+        self.current_page = 0
+
+        # These objects will hold model results.
+        self.ols_results = {}
+        self.sure_model = None
+        self.sure_results = None
+
+        # These are used for PDF export.
+        self.report_items = []
+
+        self.root.title("SURE Model Analyzer")
+        self.root.geometry("1100x780")
+
+        self.build_layout()
+        self.run_analysis()
+        self.show_page(0)
+
+    # ============================================================
+    # GUI LAYOUT
+    # ============================================================
+
+    def build_layout(self):
+
+        top = tk.Frame(self.root)
+        top.pack(fill="x")
+
+        title = tk.Label(
+            top,
+            text="Seemingly Unrelated Regression (SURE)",
+            font=("Arial", 14, "bold")
+        )
+        title.pack(side="left", padx=15, pady=10)
+
+        export_btn = tk.Button(
+            top,
+            text="Export PDF",
+            command=self.export_pdf
+        )
+        export_btn.pack(side="right", padx=10)
+
+        self.content_frame = tk.Frame(self.root)
+        self.content_frame.pack(fill="both", expand=True)
+
+        nav = tk.Frame(self.root)
+        nav.pack(fill="x")
+
+        self.prev_btn = tk.Button(nav, text="Previous", command=self.previous_page)
+        self.prev_btn.pack(side="left", padx=20, pady=10)
+
+        self.page_indicator = tk.Label(nav, text="")
+        self.page_indicator.pack(side="left", expand=True)
+
+        self.next_btn = tk.Button(nav, text="Next", command=self.next_page)
+        self.next_btn.pack(side="right", padx=20)
+
+    # ============================================================
+    # MAIN ANALYSIS
+    # ============================================================
+
+    def run_analysis(self):
+        """
+        Main econometric workflow.
+
+        The current version estimates a two-equation SURE system.
+
+        Model structure:
+            Equation 1: Y1 = Xβ1 + u1
+            Equation 2: Y2 = Xβ2 + u2
+
+        In this version, both equations use the same explanatory variables.
+        In such a case, SURE and equation-by-equation OLS often produce very
+        similar or identical coefficient estimates. However, the diagnostic
+        output remains useful because it shows whether the disturbances across
+        equations are correlated.
+        """
+
+        df = self.data.copy()
+
+        y1 = df.iloc[:, 0]
+        y2 = df.iloc[:, 1]
+
+        X = df.iloc[:, 2:]
+        X = sm.add_constant(X)
+
+        # Separate OLS models.
+        self.ols_results["eq1"] = sm.OLS(y1, X).fit()
+        self.ols_results["eq2"] = sm.OLS(y2, X).fit()
+
+        # SURE system.
+        eqs = {
+            "eq1": (y1, X),
+            "eq2": (y2, X)
+        }
+
+        self.sure_model = SUR(eqs)
+        self.sure_results = self.sure_model.fit()
+
+        # Build report pages.
+        self.add_text_page(
+            "1. Dataset Summary",
+            self.format_data_summary()
+        )
+
+        self.add_text_page(
+            "2. Methodological Explanation",
+            self.format_methodology_explanation()
+        )
+
+        self.add_text_page(
+            "3. OLS Results: Equation-by-Equation Estimation",
+            self.format_ols_results()
+        )
+
+        self.add_text_page(
+            "4. SURE Estimation Results",
+            self.format_sure_results()
+        )
+
+        self.add_text_page(
+            "5. Residual Covariance and Correlation Matrix",
+            self.format_residual_matrices()
+        )
+
+        self.add_text_page(
+            "6. Breusch-Pagan LM Test for Cross-Equation Independence",
+            self.format_breusch_pagan_test()
+        )
+
+        self.add_text_page(
+            "7. Jarque-Bera Normality Diagnostics",
+            self.format_jarque_bera_tests()
+        )
+
+        self.add_plot_page(
+            "8. Residual Scatter Plot",
+            self.plot_residuals_scatter
+        )
+
+        self.add_plot_page(
+            "9. Residual Correlation Heatmap",
+            self.plot_residual_heatmap
+        )
+
+        self.add_text_page(
+            "10. Final Interpretation Guide",
+            self.format_interpretation_guide()
+        )
+
+    # ============================================================
+    # TEXT REPORTS
+    # ============================================================
+
+    def format_data_summary(self):
+
+        text = ""
+
+        text += "DATASET SUMMARY\n"
+        text += "=" * 80 + "\n\n"
+
+        text += "Purpose of this section:\n"
+        text += (
+            "This section reports the basic structure of the imported dataset. "
+            "Before estimating any econometric model, it is necessary to verify "
+            "the number of observations, number of variables, and the variable "
+            "ordering used by the software.\n\n"
+        )
+
+        text += "Input file:\n"
+        text += f"{self.file_path}\n\n"
+
+        text += "Basic information:\n"
+        text += f"- Number of observations used after removing missing values: {len(self.data)}\n"
+        text += f"- Number of variables: {self.data.shape[1]}\n\n"
+
+        text += "Variable assignment rule used in this software:\n"
+        text += f"- Dependent variable of equation 1: {self.data.columns[0]}\n"
+        text += f"- Dependent variable of equation 2: {self.data.columns[1]}\n"
+        text += "- Explanatory variables:\n"
+
+        for c in self.data.columns[2:]:
+            text += f"  * {c}\n"
+
+        text += "\nColumn list:\n"
+
+        for c in self.data.columns:
+            text += f"- {c}\n"
+
+        text += "\nDescriptive statistics:\n"
+        text += "-" * 80 + "\n"
+        text += str(self.data.describe().T)
+        text += "\n\n"
+
+        text += "Important note:\n"
+        text += (
+            "Rows containing missing values are automatically removed before estimation. "
+            "Therefore, the number of observations reported here may be smaller than "
+            "the original number of rows in the imported file.\n"
+        )
+
+        return text
+
+    def format_methodology_explanation(self):
+
+        text = ""
+
+        text += "METHODOLOGICAL EXPLANATION\n"
+        text += "=" * 80 + "\n\n"
+
+        text += "1. What is SURE?\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "Seemingly Unrelated Regression Equations, usually abbreviated as SURE "
+            "or SUR, is an econometric method used when several regression equations "
+            "are estimated jointly. The equations may look unrelated because they "
+            "have different dependent variables, but their error terms may be "
+            "correlated.\n\n"
+        )
+
+        text += "The general two-equation system is:\n\n"
+        text += "    Equation 1:  Y1 = X1 * beta1 + u1\n"
+        text += "    Equation 2:  Y2 = X2 * beta2 + u2\n\n"
+
+        text += (
+            "The key idea is that the shocks u1 and u2 may be correlated. "
+            "For example, an omitted macroeconomic shock, policy change, market "
+            "condition, or institutional factor may affect both dependent variables "
+            "at the same time. In that case, estimating the equations jointly can "
+            "improve efficiency.\n\n"
+        )
+
+        text += "2. Difference between OLS and SURE\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "Ordinary Least Squares estimates each equation separately and ignores "
+            "possible correlation between the disturbances of different equations. "
+            "SURE, on the other hand, estimates the equations as a system and uses "
+            "the estimated covariance structure of the disturbances.\n\n"
+        )
+
+        text += (
+            "If the disturbances across equations are not correlated, SURE does not "
+            "provide a meaningful advantage over separate OLS. However, if the "
+            "disturbances are significantly correlated, SURE can produce more "
+            "efficient estimates, especially when equations have different sets of "
+            "explanatory variables.\n\n"
+        )
+
+        text += "3. Important limitation in the current model structure\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "In this software version, both equations use the same explanatory "
+            "variables. Under identical regressor matrices, the coefficient estimates "
+            "from SURE may be identical or very close to equation-by-equation OLS. "
+            "This is a known econometric result. Therefore, the main value of this "
+            "report is diagnostic: it examines whether the residuals of the equations "
+            "are correlated and whether the use of a system approach is empirically "
+            "justified.\n\n"
+        )
+
+        text += "4. Main diagnostic question\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "The central diagnostic question is:\n\n"
+            "    Are the residuals of the equations independent from each other?\n\n"
+            "If the answer is yes, separate OLS is usually sufficient. "
+            "If the answer is no, a SURE framework is more defensible.\n"
+        )
+
+        return text
+
+    def format_ols_results(self):
+
+        text = ""
+
+        text += "OLS RESULTS\n"
+        text += "=" * 80 + "\n\n"
+
+        text += "Purpose of this section:\n"
+        text += (
+            "This section reports equation-by-equation OLS results. These results "
+            "serve as a benchmark for comparison with the SURE estimates. Each "
+            "dependent variable is regressed separately on the same set of explanatory "
+            "variables.\n\n"
+        )
+
+        text += "Interpretation notes:\n"
+        text += "- Coef. shows the estimated marginal effect of each explanatory variable.\n"
+        text += "- Std.Err. shows the estimated standard error of the coefficient.\n"
+        text += "- t-statistic tests whether a coefficient is statistically different from zero.\n"
+        text += "- P>|t| shows the p-value of the individual significance test.\n"
+        text += "- R-squared measures within-equation explanatory power.\n\n"
+
+        text += "\nEQUATION 1 OLS\n"
+        text += "=" * 80 + "\n"
+        text += str(self.ols_results["eq1"].summary())
+        text += "\n\n"
+
+        text += "\nEQUATION 2 OLS\n"
+        text += "=" * 80 + "\n"
+        text += str(self.ols_results["eq2"].summary())
+        text += "\n\n"
+
+        text += "Econometric note:\n"
+        text += (
+            "OLS estimates are consistent under the standard exogeneity assumptions. "
+            "However, if the residuals of different equations are correlated, separate "
+            "OLS ignores useful information contained in the cross-equation covariance "
+            "matrix. SURE is designed to use that information.\n"
+        )
+
+        return text
+
+    def format_sure_results(self):
+
+        text = ""
+
+        text += "SURE ESTIMATION RESULTS\n"
+        text += "=" * 80 + "\n\n"
+
+        text += "Purpose of this section:\n"
+        text += (
+            "This section presents the system estimation results obtained by the "
+            "Seemingly Unrelated Regression estimator. Unlike equation-by-equation "
+            "OLS, SURE estimates the system jointly and accounts for possible "
+            "correlation between the error terms of the equations.\n\n"
+        )
+
+        text += "Model system:\n"
+        text += f"- Equation 1 dependent variable: {self.data.columns[0]}\n"
+        text += f"- Equation 2 dependent variable: {self.data.columns[1]}\n"
+        text += "- Common explanatory variables:\n"
+
+        for c in self.data.columns[2:]:
+            text += f"  * {c}\n"
+
+        text += "\nSURE output:\n"
+        text += "-" * 80 + "\n"
+        text += str(self.sure_results.summary)
+        text += "\n\n"
+
+        text += "Interpretation note:\n"
+        text += (
+            "If the coefficient estimates are very similar to the OLS estimates, "
+            "this may be due to the fact that both equations use the same set of "
+            "explanatory variables. The main issue is therefore not only coefficient "
+            "difference, but whether the residual covariance structure indicates "
+            "cross-equation dependence.\n"
+        )
+
+        return text
+
+    def get_residual_dataframe(self):
+
+        res = self.sure_results.resids
+
+        if isinstance(res, pd.DataFrame):
+            return res.copy()
+
+        return pd.DataFrame(res)
+
+    def format_residual_matrices(self):
+
+        res = self.get_residual_dataframe()
+
+        cov_matrix = res.cov()
+        corr_matrix = res.corr()
+
+        text = ""
+
+        text += "RESIDUAL COVARIANCE AND CORRELATION MATRIX\n"
+        text += "=" * 80 + "\n\n"
+
+        text += "Purpose of this section:\n"
+        text += (
+            "The central assumption behind SURE is that the error terms of different "
+            "equations may be contemporaneously correlated. This section reports the "
+            "estimated covariance and correlation matrices of the residuals.\n\n"
+        )
+
+        text += "Residual covariance matrix:\n"
+        text += "-" * 80 + "\n"
+        text += str(cov_matrix)
+        text += "\n\n"
+
+        text += "Residual correlation matrix:\n"
+        text += "-" * 80 + "\n"
+        text += str(corr_matrix)
+        text += "\n\n"
+
+        text += "Interpretation:\n"
+        text += (
+            "The covariance matrix reports the absolute co-movement between residuals. "
+            "The correlation matrix standardizes this relationship and ranges from "
+            "-1 to +1. A value close to zero suggests weak cross-equation dependence. "
+            "A value far from zero suggests that the equations share common shocks "
+            "or omitted factors.\n"
+        )
+
+        return text
+
+    def breusch_pagan_lm_test(self):
+
+        res = self.get_residual_dataframe()
+        n = res.shape[0]
+        m = res.shape[1]
+
+        corr = res.corr().values
+
+        lm_sum = 0.0
+
+        for i in range(m):
+            for j in range(i + 1, m):
+                lm_sum += corr[i, j] ** 2
+
+        lm_stat = n * lm_sum
+        df = m * (m - 1) / 2
+        p_value = 1 - chi2.cdf(lm_stat, df)
+
+        return lm_stat, df, p_value
+
+    def format_breusch_pagan_test(self):
+
+        lm_stat, df, p_value = self.breusch_pagan_lm_test()
+
+        text = ""
+
+        text += "BREUSCH-PAGAN LM TEST FOR CROSS-EQUATION INDEPENDENCE\n"
+        text += "=" * 80 + "\n\n"
+
+        text += "Purpose of this test:\n"
+        text += (
+            "The Breusch-Pagan LM test examines whether the residuals of different "
+            "equations are independent. This is a key diagnostic test for deciding "
+            "whether a system estimator such as SURE is justified.\n\n"
+        )
+
+        text += "Null and alternative hypotheses:\n"
+        text += "-" * 80 + "\n"
+        text += "H0: Residuals across equations are independent.\n"
+        text += "H1: Residuals across equations are correlated.\n\n"
+
+        text += "Test statistic:\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "For a system with m equations and T observations, the LM statistic is:\n\n"
+            "    LM = T * sum(r_ij^2)\n\n"
+            "where r_ij is the sample correlation between residuals of equation i "
+            "and equation j. Under the null hypothesis, the statistic follows a "
+            "chi-square distribution with m(m-1)/2 degrees of freedom.\n\n"
+        )
+
+        text += "Computed result:\n"
+        text += "-" * 80 + "\n"
+        text += f"LM statistic       : {lm_stat:.6f}\n"
+        text += f"Degrees of freedom : {int(df)}\n"
+        text += f"P-value            : {p_value:.6f}\n\n"
+
+        text += "Decision rule:\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "If the p-value is smaller than 0.05, reject H0 at the 5 percent "
+            "significance level. This means that residuals are significantly "
+            "correlated across equations, and the use of SURE is empirically "
+            "defensible.\n\n"
+        )
+
+        if p_value < 0.05:
+            text += "Conclusion:\n"
+            text += (
+                "The p-value is below 0.05. Therefore, the null hypothesis of "
+                "cross-equation residual independence is rejected. The evidence "
+                "supports the presence of correlated disturbances across equations. "
+                "Using SURE is justified from a diagnostic perspective.\n"
+            )
+        else:
+            text += "Conclusion:\n"
+            text += (
+                "The p-value is not below 0.05. Therefore, the null hypothesis of "
+                "cross-equation residual independence cannot be rejected. The evidence "
+                "does not strongly support the necessity of SURE over separate OLS.\n"
+            )
+
+        return text
+
+    def format_jarque_bera_tests(self):
+
+        res = self.get_residual_dataframe()
+
+        text = ""
+
+        text += "JARQUE-BERA NORMALITY DIAGNOSTICS\n"
+        text += "=" * 80 + "\n\n"
+
+        text += "Purpose of this section:\n"
+        text += (
+            "The Jarque-Bera test evaluates whether the residuals of each equation "
+            "are normally distributed. Normality is not always required for consistency "
+            "of coefficient estimates, but it is often relevant for small-sample "
+            "inference and classical diagnostic reporting.\n\n"
+        )
+
+        text += "Null and alternative hypotheses:\n"
+        text += "-" * 80 + "\n"
+        text += "H0: Residuals are normally distributed.\n"
+        text += "H1: Residuals are not normally distributed.\n\n"
+
+        text += "Results:\n"
+        text += "-" * 80 + "\n"
+
+        for col in res.columns:
+            jb_stat, jb_pvalue, skewness, kurtosis = jarque_bera(res[col])
+
+            text += f"\nEquation: {col}\n"
+            text += f"Jarque-Bera statistic : {jb_stat:.6f}\n"
+            text += f"P-value               : {jb_pvalue:.6f}\n"
+            text += f"Skewness              : {skewness:.6f}\n"
+            text += f"Kurtosis              : {kurtosis:.6f}\n"
+
+            if jb_pvalue < 0.05:
+                text += (
+                    "Conclusion             : Reject normality at the 5 percent level.\n"
+                )
+            else:
+                text += (
+                    "Conclusion             : Do not reject normality at the 5 percent level.\n"
+                )
+
+        text += "\nInterpretation note:\n"
+        text += (
+            "A small p-value indicates deviation from normality. If residuals are "
+            "not normally distributed, researchers may consider robust inference, "
+            "transformations, or checking for outliers and model misspecification.\n"
+        )
+
+        return text
+
+    def format_interpretation_guide(self):
+
+        lm_stat, df, p_value = self.breusch_pagan_lm_test()
+        res = self.get_residual_dataframe()
+        corr_matrix = res.corr()
+
+        text = ""
+
+        text += "FINAL INTERPRETATION GUIDE\n"
+        text += "=" * 80 + "\n\n"
+
+        text += "This section provides a structured guide for interpreting the report.\n\n"
+
+        text += "1. First check the OLS results\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "Review coefficient signs, statistical significance, R-squared, and "
+            "standard diagnostic warnings. OLS results provide the baseline model "
+            "for each equation.\n\n"
+        )
+
+        text += "2. Then check the SURE results\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "Compare the SURE coefficients and standard errors with the OLS results. "
+            "When all equations use identical explanatory variables, the estimated "
+            "coefficients may be very similar to OLS. This does not necessarily mean "
+            "the software is wrong; it is a known property of the estimator.\n\n"
+        )
+
+        text += "3. Focus on residual correlation\n"
+        text += "-" * 80 + "\n"
+        text += "Residual correlation matrix:\n"
+        text += str(corr_matrix)
+        text += "\n\n"
+
+        text += (
+            "High residual correlation indicates that unobserved shocks may jointly "
+            "affect the equations. This is the main empirical motivation for using "
+            "SURE.\n\n"
+        )
+
+        text += "4. Use the Breusch-Pagan LM test as formal evidence\n"
+        text += "-" * 80 + "\n"
+        text += f"LM statistic: {lm_stat:.6f}\n"
+        text += f"P-value     : {p_value:.6f}\n\n"
+
+        if p_value < 0.05:
+            text += (
+                "Because the p-value is smaller than 0.05, the test supports the "
+                "presence of cross-equation residual correlation. Therefore, reporting "
+                "SURE results is justified.\n\n"
+            )
+        else:
+            text += (
+                "Because the p-value is not smaller than 0.05, there is not enough "
+                "evidence of cross-equation residual correlation. In this case, "
+                "separate OLS may be sufficient.\n\n"
+            )
+
+        text += "5. Academic reporting suggestion\n"
+        text += "-" * 80 + "\n"
+        text += (
+            "In an academic paper or thesis, report:\n"
+            "- The reason for using a system estimator.\n"
+            "- The OLS benchmark results.\n"
+            "- The SURE estimation results.\n"
+            "- The residual covariance/correlation matrix.\n"
+            "- The Breusch-Pagan LM test statistic and p-value.\n"
+            "- Normality diagnostics or other residual checks.\n\n"
+        )
+
+        text += "Recommended wording:\n"
+        text += (
+            "The SURE approach was considered because the dependent variables may "
+            "be affected by common unobserved shocks. The Breusch-Pagan LM test was "
+            "used to examine cross-equation residual independence. The results show "
+            "whether system estimation is empirically justified relative to separate "
+            "equation-by-equation OLS estimation.\n"
+        )
+
+        return text
+
+    # ============================================================
+    # PLOTS
+    # ============================================================
+
+    def plot_residuals_scatter(self, fig, ax):
+
+        res = self.get_residual_dataframe()
+
+        r1 = res.iloc[:, 0]
+        r2 = res.iloc[:, 1]
+
+        ax.scatter(r1, r2, alpha=0.75)
+
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.axvline(0, color="black", linewidth=0.8)
+
+        ax.set_title("Residual Correlation Between Equations")
+        ax.set_xlabel("Residuals of Equation 1")
+        ax.set_ylabel("Residuals of Equation 2")
+
+        corr = np.corrcoef(r1, r2)[0, 1]
+
+        ax.text(
+            0.05,
+            0.92,
+            f"Correlation = {corr:.3f}",
+            transform=ax.transAxes,
+            bbox=dict(facecolor="white", edgecolor="gray", alpha=0.8)
+        )
+
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+    def plot_residual_heatmap(self, fig, ax):
+
+        res = self.get_residual_dataframe()
+        corr = res.corr()
+
+        im = ax.imshow(corr.values, cmap="coolwarm", vmin=-1, vmax=1)
+
+        ax.set_title("Residual Correlation Heatmap")
+
+        ax.set_xticks(range(len(corr.columns)))
+        ax.set_yticks(range(len(corr.columns)))
+
+        ax.set_xticklabels(corr.columns)
+        ax.set_yticklabels(corr.columns)
+
+        for i in range(len(corr.columns)):
+            for j in range(len(corr.columns)):
+                ax.text(
+                    j,
+                    i,
+                    f"{corr.values[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    color="black"
+                )
+
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # ============================================================
+    # PAGE BUILDERS
+    # ============================================================
+
+    def add_text_page(self, title, content):
+
+        page = tk.Frame(self.content_frame)
+
+        title_label = tk.Label(page, text=title, font=("Arial", 14, "bold"))
+        title_label.pack(pady=10)
+
+        text_frame = tk.Frame(page)
+        text_frame.pack(fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(text_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        text_widget = tk.Text(
+            text_frame,
+            font=("Consolas", 10),
+            wrap="none",
+            yscrollcommand=scrollbar.set
+        )
+        text_widget.pack(fill="both", expand=True)
+
+        scrollbar.config(command=text_widget.yview)
+
+        text_widget.insert("1.0", content)
+        text_widget.config(state="disabled")
+
+        self.pages.append(page)
+        self.page_titles.append(title)
+
+        self.report_items.append({
+            "type": "text",
+            "title": title,
+            "content": content
+        })
+
+    def add_plot_page(self, title, plot_function):
+
+        page = tk.Frame(self.content_frame)
+
+        title_label = tk.Label(page, text=title, font=("Arial", 14, "bold"))
+        title_label.pack(pady=10)
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        plot_function(fig, ax)
+
+        canvas = FigureCanvasTkAgg(fig, master=page)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        plt.close(fig)
+
+        self.pages.append(page)
+        self.page_titles.append(title)
+
+        self.report_items.append({
+            "type": "plot",
+            "title": title,
+            "plot_function": plot_function
+        })
+
+    # ============================================================
+    # NAVIGATION
+    # ============================================================
+
+    def show_page(self, i):
+
+        for p in self.pages:
+            p.pack_forget()
+
+        self.pages[i].pack(fill="both", expand=True)
+
+        self.current_page = i
+
+        self.page_indicator.config(
+            text=f"Page {i + 1} / {len(self.pages)}"
+        )
+
+        self.prev_btn.config(state="normal" if i > 0 else "disabled")
+        self.next_btn.config(state="normal" if i < len(self.pages) - 1 else "disabled")
+
+    def next_page(self):
+
+        if self.current_page < len(self.pages) - 1:
+            self.show_page(self.current_page + 1)
+
+    def previous_page(self):
+
+        if self.current_page > 0:
+            self.show_page(self.current_page - 1)
+
+    # ============================================================
+    # PDF EXPORT HELPERS
+    # ============================================================
+
+    def add_text_to_pdf(self, pdf, title, content):
+        """
+        Adds wrapped text to PDF pages.
+
+        This function prevents long model summaries from being cut off
+        by automatically wrapping lines and splitting the content across
+        multiple A4 pages.
+        """
+
+        page_width = 8.27
+        page_height = 11.69
+
+        left_margin = 0.55
+        top_margin = 10.95
+        line_height = 0.18
+
+        max_chars = 95
+
+        wrapped_lines = []
+
+        wrapped_lines.append(title)
+        wrapped_lines.append("=" * min(len(title), 80))
+        wrapped_lines.append("")
+
+        for line in content.split("\n"):
+            if len(line) == 0:
+                wrapped_lines.append("")
+            else:
+                chunks = textwrap.wrap(
+                    line,
+                    width=max_chars,
+                    replace_whitespace=False,
+                    drop_whitespace=False
+                )
+                if chunks:
+                    wrapped_lines.extend(chunks)
+                else:
+                    wrapped_lines.append(line)
+
+        current_index = 0
+
+        while current_index < len(wrapped_lines):
+
+            fig = plt.figure(figsize=(page_width, page_height))
+            fig.patch.set_facecolor("white")
+
+            y = top_margin
+
+            while current_index < len(wrapped_lines) and y > 0.55:
+                fig.text(
+                    left_margin / page_width,
+                    y / page_height,
+                    wrapped_lines[current_index],
+                    ha="left",
+                    va="top",
+                    fontsize=8,
+                    family="monospace"
+                )
+
+                y -= line_height
+                current_index += 1
+
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    def add_plot_to_pdf(self, pdf, title, plot_function):
+
+        fig, ax = plt.subplots(figsize=(8.27, 6.0))
+
+        plot_function(fig, ax)
+
+        fig.suptitle(title, fontsize=13, fontweight="bold")
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    # ============================================================
+    # PDF EXPORT
+    # ============================================================
+
+    def export_pdf(self):
+
+        path = filedialog.asksaveasfilename(
+            title="Save PDF Report",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")]
+        )
+
+        if not path:
+            return
+
+        try:
+            with PdfPages(path) as pdf:
+
+                # Cover page.
+                fig = plt.figure(figsize=(8.27, 11.69))
+                fig.patch.set_facecolor("white")
+
+                cover_text = (
+                    "SURE ECONOMETRIC REPORT\n\n"
+                    "Seemingly Unrelated Regression Analysis\n\n"
+                    f"Input file:\n{self.file_path}\n\n"
+                    f"Observations: {len(self.data)}\n"
+                    f"Variables: {self.data.shape[1]}\n\n"
+                    "This report includes:\n"
+                    "- Dataset summary\n"
+                    "- OLS benchmark estimation\n"
+                    "- SURE system estimation\n"
+                    "- Residual covariance and correlation analysis\n"
+                    "- Breusch-Pagan LM test for cross-equation independence\n"
+                    "- Jarque-Bera normality diagnostics\n"
+                    "- Residual plots and heatmap\n\n"
+                    "Generated by SURE Econometric Analyzer"
+                )
+
+                fig.text(
+                    0.08,
+                    0.92,
+                    cover_text,
+                    va="top",
+                    ha="left",
+                    fontsize=12,
+                    family="monospace"
+                )
+
+                pdf.savefig(fig)
+                plt.close(fig)
+
+                # Report pages.
+                for item in self.report_items:
+                    if item["type"] == "text":
+                        self.add_text_to_pdf(
+                            pdf,
+                            item["title"],
+                            item["content"]
+                        )
+                    elif item["type"] == "plot":
+                        self.add_plot_to_pdf(
+                            pdf,
+                            item["title"],
+                            item["plot_function"]
+                        )
+
+            messagebox.showinfo("Done", "PDF exported successfully.")
+
+        except Exception as e:
+            messagebox.showerror("PDF Export Error", str(e))
+
+
+# ============================================================
+# RUN APPLICATION
+# ============================================================
+
+if __name__ == "__main__":
+
+    root = tk.Tk()
+    app = ImportWindow(root)
+    root.mainloop()
